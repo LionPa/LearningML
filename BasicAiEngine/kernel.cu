@@ -26,7 +26,39 @@ extern "C" __global__ void add_bias_batched(float* data, const float* bias, int 
     }
 }
 
-extern "C" __global__ void rmsnorm(const float* input, float* output, float* gamma) {
-    b
+extern "C" __global__ void rmsnorm(const float* input, float* output, float* gamma, int features, float eps, int batches) {
+    int current_batch = blockIdx.x; // Почему так? Потому что мы делаем всё в одном блоке. Это можно понять по циклу
 
+    if (current_batch >= batches) return;
+
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = batches * features;
+
+    const float* row_in = input + current_batch * features;
+    float* row_out = output + current_batch * features;
+
+    __shared__ float s_sum;
+
+    if (threadIdx.x == 0) {
+        s_sum = 0.0f;
+    }
+    __syncthreads(); // Ждем, пока поток 0 обнулит память
+
+    // Суммируем квадраты
+    float local_sum = 0;
+
+    for (int i = threadIdx.x; i < features; i += blockDim.x) {
+        float val = row_in[i];
+        local_sum += val * val;
+    }
+
+    atomicAdd(&s_sum, local_sum); // Переписать на Reduction Tree, когда надо будет
+
+    __syncthreads(); // Синкуем всё, что бы убедиться что все закончили
+
+    float s_inv_rms = rsqrtf(s_sum / features + eps); // Каждый поток считает одно и тоже значение. Подумать над возможной оптимизацией
+
+    for (int i = threadIdx.x; i < features; i += blockDim.x) {
+        row_out[i] = row_in[i] * s_inv_rms * gamma[i];
+    }
 }

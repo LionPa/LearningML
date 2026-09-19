@@ -1,10 +1,13 @@
+mod kernel;
+
 use std::error::Error;
 use std::sync::Arc;
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{ compile_ptx_with_opts, CompileOptions };
 use rand::RngExt;
+use crate::kernel::{add_bias_batched, rmsnorm};
 
 pub struct LinearLayer {
     pub in_features: usize,
@@ -12,11 +15,14 @@ pub struct LinearLayer {
 
     pub weights: CudaSlice<f32>,
     pub bias: CudaSlice<f32>,
+    pub gamma: CudaSlice<f32>,
 
     pub grad_weights: Option<CudaSlice<f32>>,
     pub grad_bias: Option<CudaSlice<f32>>,
+    pub grad_gamma: Option<CudaSlice<f32>>,
 
     pub saved_input: Option<CudaSlice<f32>>,
+    pub saved_no_normalized_input: Option<CudaSlice<f32>>,
     pub saved_linear: Option<CudaSlice<f32>>, // z до ReLU
 }
 
@@ -28,11 +34,14 @@ impl LinearLayer {
 
             weights: stream.alloc_zeros(in_features * (out_features * 2))?,
             bias: stream.alloc_zeros(out_features * 2)?,
+            gamma: stream.alloc_zeros(in_features)?,
 
             grad_weights: alloc_learning_slice(stream, (in_features * (out_features * 2)) as i32, mode), // x2 для SwiGLU весов gate и нового up
             grad_bias: alloc_learning_slice(stream, (out_features * 2) as i32, mode),
+            grad_gamma: alloc_learning_slice(stream, in_features as i32, mode), // in_features потому что pre нормализация
 
             saved_input: alloc_learning_slice(stream, batches * in_features as i32, mode),
+            saved_no_normalized_input: alloc_learning_slice(stream, batches * in_features as i32, mode),
             saved_linear: alloc_learning_slice(stream, batches * (out_features * 2) as i32, mode)
         })
     }
@@ -45,6 +54,7 @@ pub struct NeuralNetwork {
 pub struct KernelFunctions {
     swiglu: CudaFunction,
     add_bias_batched: CudaFunction,
+    rmsnorm: CudaFunction,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -61,7 +71,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Functions
     let kernel_functions = KernelFunctions {
         swiglu: module.load_function("swiglu_forward")?,
-        add_bias_batched: module.load_function("add_bias_batched")?
+        add_bias_batched: module.load_function("add_bias_batched")?,
+        rmsnorm: module.load_function("rmsnorm")?,
     };
 
     // Структуры тестовой нейронки. 5 входных - 3 - 3 - 2 выходных
@@ -137,12 +148,15 @@ fn fill_network_with_noise(stream: &Arc<CudaStream>, neural_network: &mut Neural
             .collect();
 
         let bias = vec![0f32; layer.out_features * 2];
+        let gamma = vec![1f32; layer.in_features];
 
         let layer_weight = &mut layer.weights;
         let layer_bias = &mut layer.bias;
+        let layer_gamma = &mut layer.gamma;
 
         stream.memcpy_htod(weights.as_slice(), layer_weight)?;
         stream.memcpy_htod(bias.as_slice(), layer_bias)?;
+        stream.memcpy_htod(gamma.as_slice(), layer_gamma)?;
     }
 
     Ok(())
@@ -211,6 +225,14 @@ fn step(
     let out_features = layer.out_features as i32;
     let swiglu_features = out_features * 2;
 
+    if mode { // Training
+        let u_batches = batches as usize;
+
+        stream.memcpy_dtod(&in_buf.slice(0..u_batches * layer.in_features), layer.saved_no_normalized_input.as_mut().unwrap())?;
+    }
+
+    rmsnorm(stream, kernel_functions, in_buf, in_buf, &layer.gamma, in_features, batches)?;
+
     let gemm_cfg = GemmConfig {
         transa: cublasOperation_t::CUBLAS_OP_N,
         transb: cublasOperation_t::CUBLAS_OP_N,
@@ -228,7 +250,7 @@ fn step(
         blas.gemm(gemm_cfg, &layer.weights, in_buf, out_buf)?
     }
 
-    add_bias_batched(stream, kernel_functions, out_buf, &layer.bias, &swiglu_features, &batches)?;
+    add_bias_batched(stream, kernel_functions, out_buf, &layer.bias, &swiglu_features, batches)?;
 
     if mode { // Training
         let u_batches = batches as usize;
@@ -246,7 +268,6 @@ fn step(
 
     unsafe { launch_args.launch(launch_cfg)? };
 
-
     Ok(())
 }
 
@@ -254,46 +275,3 @@ fn backprop() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
-
-// TODO Вынести в отдельный файл
-fn add_bias_batched(
-    stream: &Arc<CudaStream>,
-    kernel_functions: &KernelFunctions,
-    out_buf: &CudaSlice<f32>,
-    bias: &CudaSlice<f32>,
-    swiglu_features: &i32,
-    batches: &i32
-) -> Result<(), Box<dyn Error>> {
-    let launch_cfg = LaunchConfig::for_num_elems(*batches as u32 * *swiglu_features as u32);
-
-    let mut launch_args = stream.launch_builder(&kernel_functions.add_bias_batched);
-    launch_args.arg(&*out_buf);
-    launch_args.arg(bias);
-    launch_args.arg(batches);
-    launch_args.arg(swiglu_features);
-
-    unsafe { launch_args.launch(launch_cfg)? };
-
-    Ok(())
-}
-
-
-//let gemv_cfg = GemvConfig {
-//    trans: cublasOperation_t::CUBLAS_OP_N,
-//    n: layer.in_features as i32,
-//    m: layer.out_features as i32 * 2,
-//    alpha: 1f32,
-//    beta: 1f32,
-//    lda: layer.out_features as i32 * 2,
-//    incx: 1,
-//    incy: 1,
-//};
-
-//unsafe {
-//    blas.gemv(
-//        gemv_cfg,
-//        &layer.weights,
-//        in_buf,
-//        out_buf,
-//    )?;
-//}
