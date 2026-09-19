@@ -1,0 +1,8 @@
+[package]
+name = "BasicAiEngine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cudarc = { version = "0.19.9", features = ["nvrtc", "cuda-13020", "cublas"] }
+rand = "0.10.2"
